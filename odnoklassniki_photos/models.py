@@ -72,41 +72,48 @@ class AlbumRemoteManager(OdnoklassnikiManager):
         return result
 
 
-class Album(OdnoklassnikiPKModel):
+class Likable(object):
+    fetch_like_users_limit = 100
+
+    def update_likes(self, instances, *args, **kwargs):
+        if not getattr(self, 'like_users'):
+            raise Exception('Model derriving from Likable should have like_users field')
+
+        users = User.objects.filter(pk__in=instances)
+        self.like_users = users
+        self.save()
+        return users
+
+    @atomic
+    @fetch_all(return_all=update_likes)
+    def fetch_likes(self, **kwargs):
+        kwargs['gid'] = self.owner.pk
+
+        if not kwargs.get('count'):
+            kwargs['count'] = self.__class__.fetch_like_users_limit
+
+        kwargs['fields'] = self.__class__.remote.get_request_fields('user', prefix=True)
+
+        response = self.__class__.remote.api_call(method='get_likes', **kwargs)
+        users = response.get('users')
+        if users:
+            users_ids = User.remote.get_or_create_from_resources_list(users).values_list('pk', flat=True)
+        else:
+            users_ids = EmptyQuerySet(model=User)
+
+        return users_ids, response
+
+
+class PhotoBase(OdnoklassnikiPKModel, Likable):
     class Meta:
-        verbose_name = u'Альбом фотографий Одноклассники'
-        verbose_name_plural = u'Альбомы фотографий Одноклассники'
+        abstract = True
 
     methods_namespace = 'photos'
 
-    remote_pk_field = 'aid'
-
-    title = models.TextField()
-
     owner_name = models.TextField()
-
-    owner_content_type = models.ForeignKey(ContentType, related_name='odnoklassniki_albums_owners')
-    owner_id = models.BigIntegerField(db_index=True)
-    owner = generic.GenericForeignKey('owner_content_type', 'owner_id')
-
-    created = models.DateField(null=True)
-
-    photos_count = models.PositiveIntegerField(default=0)
 
     likes_count = models.PositiveIntegerField(default=0)
     last_like_date = models.DateTimeField(null=True)
-
-    remote = AlbumRemoteManager(methods={
-        'get': 'getAlbums',
-        'get_one': 'getAlbumInfo',
-    })
-
-    @property
-    def slug(self):
-        return '%s/album/%s' % (self.owner.slug, self.id)
-
-    def __unicode__(self):
-        return self.title
 
     def parse(self, response):
         if response.get('author_name'):
@@ -128,11 +135,48 @@ class Album(OdnoklassnikiPKModel):
                 value = None
             self.last_like_date = value
 
-        return super(Album, self).parse(response)
+        return super(PhotoBase, self).parse(response)
+
+
+class Album(PhotoBase):
+    class Meta:
+        verbose_name = u'Альбом фотографий Одноклассники'
+        verbose_name_plural = u'Альбомы фотографий Одноклассники'
+
+    remote_pk_field = 'aid'
+
+    created = models.DateField(null=True)
+
+    like_users = ManyToManyHistoryField(User, related_name='like_albums')
+
+    owner_content_type = models.ForeignKey(ContentType, related_name='odnoklassniki_albums_owners')
+    owner_id = models.BigIntegerField(db_index=True)
+    owner = generic.GenericForeignKey('owner_content_type', 'owner_id')
+
+    photos_count = models.PositiveIntegerField(default=0)
+
+    title = models.TextField()
+
+    remote = AlbumRemoteManager(methods={
+        'get': 'getAlbums',
+        'get_one': 'getAlbumInfo',
+        'get_likes': 'getAlbumLikes',
+    })
+
+    @property
+    def slug(self):
+        return '%s/album/%s' % (self.owner.slug, self.id)
+
+    def __unicode__(self):
+        return self.id
 
     def fetch_photos(self, **kwargs):
         return Photo.remote.fetch(group=self.owner, album=self, **kwargs)
 
+    def fetch_likes(self, **kwargs):
+        kwargs['aid'] = self.pk
+
+        return super(Album, self).fetch_likes(**kwargs)
 
 class PhotoRemoteManager(OdnoklassnikiManager):
 
@@ -192,7 +236,7 @@ class PhotoRemoteManager(OdnoklassnikiManager):
     @atomic
     def _fetch_all_for_group(self, **kwargs):
         group = kwargs['group']
-        albums = Album.remote.fetch(group)
+        albums = Album.remote.fetch(group, all=True)
 
         overall_result = EmptyQuerySet(model=Photo)
         last_result = EmptyQuerySet(model=Photo)
@@ -246,14 +290,11 @@ class PhotoRemoteManager(OdnoklassnikiManager):
             return super(PhotoRemoteManager, self).fetch(**kwargs_copy)
 
 
-class Photo(OdnoklassnikiPKModel):
+class Photo(PhotoBase):
     class Meta:
         verbose_name = u'Фотография Одноклассники'
         verbose_name_plural = u'Фотографии Одноклассники'
 
-    fetch_like_users_limit = 100
-
-    methods_namespace = 'photos'
     remote_pk_field = 'id'
 
     album = models.ForeignKey(Album, related_name='photos')
@@ -262,15 +303,11 @@ class Photo(OdnoklassnikiPKModel):
 
     created = models.DateTimeField(null=True)
 
-    likes_count = models.PositiveIntegerField(default=0)
-    last_like_date = models.DateTimeField(null=True)
     like_users = ManyToManyHistoryField(User, related_name='like_photos')
 
     owner_content_type = models.ForeignKey(ContentType, related_name='odnoklassniki_photos_owners')
     owner_id = models.BigIntegerField(db_index=True)
     owner = generic.GenericForeignKey('owner_content_type', 'owner_id')
-
-    owner_name = models.TextField()
 
     pic1024max = models.URLField(null=True)
     pic1024x768 = models.URLField(null=True)
@@ -294,59 +331,23 @@ class Photo(OdnoklassnikiPKModel):
         'get_likes': 'getPhotoLikes',
         })
 
-    def update_likes(self, instances, *args, **kwargs):
-        users = User.objects.filter(pk__in=instances)
-        self.like_users = users
-        self.save()
-        return users
-
-    @atomic
-    @fetch_all(return_all=update_likes)
     def fetch_likes(self, **kwargs):
         kwargs['photo_id'] = self.pk
-        kwargs['gid'] = self.owner.pk
 
-        if not kwargs.get('count'):
-            kwargs['count'] = self.__class__.fetch_like_users_limit
-
-        kwargs['fields'] = Photo.remote.get_request_fields('user', prefix=True)
-
-        response = Photo.remote.api_call(method='get_likes', **kwargs)
-        users = response.get('users')
-        if users:
-            users_ids = User.remote.get_or_create_from_resources_list(users).values_list('pk', flat=True)
-        else:
-            users_ids = EmptyQuerySet(model=User)
-
-        return users_ids, response
+        return super(Photo, self).fetch_likes(**kwargs)
 
     @property
     def slug(self):
         # Apparently there is no slug for a photo
         return '%s' % (self.album.slug, )
 
+    def __unicode__(self):
+        return self.text
+
     def parse(self, response):
-        self.owner_name = response.pop('author_name', u'')
-
-        if response.get('author_type') not in ['GROUP', None]:
-            raise NotImplementedError('Not implemented for author_type other than GROUP')
-
-        if response.get('group_id'):
-            self.owner_id = int(response.pop('group_id'))
-            self.owner = Group.objects.get(id=self.owner_id)
-
         created = response.pop('created_ms', None)
         if created:
             response[u'created'] = created/1000
-
-        summary = response.pop('like_summary', None)
-        if summary:
-            self.likes_count = summary.get('count', 0)
-            try:
-                value = datetime.utcfromtimestamp(int(summary['last_like_date_ms'])/1000).replace(tzinfo=utc)
-            except:
-                value = None
-            self.last_like_date = value
 
         if response.get('album_id'):
             self.album = Album.objects.get(id=int(response.get('album_id')))

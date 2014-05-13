@@ -136,6 +136,25 @@ class OdnoklassnikiPhotosTest(TestCase):
         self.assertEqual(instance.last_like_date, datetime(2014, 5, 8, 16, 46, 28, tzinfo=utc))
         self.assertEqual(instance.owner, group)
 
+    def test_album_fetch_likes(self, *kwargs):
+        group = GroupFactory(id=GROUP_ID)
+
+        album = Album.remote.fetch_group_specific(ids=[ALBUM1_ID], group=group)[0]
+
+        users = album.fetch_likes(count=50)
+
+        self.assertEqual(50, len(users))
+        self.assertEqual(50, User.objects.count())
+
+        users = album.fetch_likes(all=True)
+
+        # because API can return users count less than desired in count parameter. Forced to do this kind of checks
+        self.assertTrue(len(users) <= album.likes_count)
+        self.assertTrue(len(users) > User.remote.__class__.fetch_users_limit)
+
+        self.assertEqual(len(users), User.objects.count())
+        self.assertEqual(len(users), album.like_users.count())
+
     def test_group_fetch_albums(self):
         group = GroupFactory(id=GROUP_ID)
 
